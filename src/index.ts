@@ -74,6 +74,43 @@ interface Campaign {
   status?: string;
   created_at?: string;
   updated_at?: string;
+  sequences?: Sequence[];
+}
+
+interface Variant {
+  subject?: string;
+  body: string;
+}
+
+interface Step {
+  type: string;
+  delay: number;
+  delay_unit?: string;
+  pre_delay_unit?: string;
+  variants: Variant[];
+}
+
+interface Sequence {
+  steps: Step[];
+}
+
+interface SequenceSnapshot {
+  campaign_id: string;
+  campaign_name: string;
+  sequences: {
+    sequence_index: number;
+    steps: {
+      step_index: number;
+      delay: number;
+      delay_unit?: string;
+      variants: {
+        variant_index: number;
+        subject: string;
+        body_preview: string;
+        body_length: number;
+      }[];
+    }[];
+  }[];
 }
 
 interface CampaignAnalytics {
@@ -197,7 +234,140 @@ async function pauseCampaign(campaignId: string): Promise<{ success: boolean; st
   return apiRequest(`/campaigns/${encodeURIComponent(campaignId)}/pause`, "POST");
 }
 
+// Sequence Variant Management (A/B testing)
+
+async function patchCampaign(
+  campaignId: string,
+  body: Record<string, unknown>
+): Promise<Campaign> {
+  return apiRequest<Campaign>(`/campaigns/${encodeURIComponent(campaignId)}`, "PATCH", body);
+}
+
+function previewBody(body: string, max: number = 80): string {
+  const stripped = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return stripped.length > max ? stripped.slice(0, max) + "..." : stripped;
+}
+
+async function getSequenceSnapshot(campaignId: string): Promise<SequenceSnapshot> {
+  const campaign = await apiRequest<Campaign>(
+    `/campaigns/${encodeURIComponent(campaignId)}`
+  );
+  const sequences = campaign.sequences || [];
+  return {
+    campaign_id: campaign.id,
+    campaign_name: campaign.name,
+    sequences: sequences.map((seq, seqIdx) => ({
+      sequence_index: seqIdx,
+      steps: (seq.steps || []).map((step, stepIdx) => ({
+        step_index: stepIdx,
+        delay: step.delay,
+        delay_unit: step.delay_unit,
+        variants: (step.variants || []).map((v, vIdx) => ({
+          variant_index: vIdx,
+          subject: v.subject ?? "",
+          body_preview: previewBody(v.body),
+          body_length: v.body.length,
+        })),
+      })),
+    })),
+  };
+}
+
+function ensureStep(campaign: Campaign, sequenceIndex: number, stepIndex: number): Step {
+  const sequences = campaign.sequences;
+  if (!sequences || sequences.length === 0) {
+    throw new Error(`Campaign ${campaign.id} has no sequences.`);
+  }
+  if (sequenceIndex < 0 || sequenceIndex >= sequences.length) {
+    throw new Error(`sequenceIndex ${sequenceIndex} out of range (0..${sequences.length - 1}).`);
+  }
+  const steps = sequences[sequenceIndex].steps || [];
+  if (stepIndex < 0 || stepIndex >= steps.length) {
+    throw new Error(`stepIndex ${stepIndex} out of range for sequence ${sequenceIndex} (0..${steps.length - 1}).`);
+  }
+  return steps[stepIndex];
+}
+
+async function addStepVariant(
+  campaignId: string,
+  sequenceIndex: number,
+  stepIndex: number,
+  variant: Variant
+): Promise<SequenceSnapshot> {
+  if (!variant.body || variant.body.trim().length === 0) {
+    throw new Error("variant.body is required and must be non-empty.");
+  }
+  const campaign = await apiRequest<Campaign>(
+    `/campaigns/${encodeURIComponent(campaignId)}`
+  );
+  const step = ensureStep(campaign, sequenceIndex, stepIndex);
+  step.variants = step.variants || [];
+  step.variants.push({
+    subject: variant.subject ?? "",
+    body: variant.body,
+  });
+  await patchCampaign(campaignId, { sequences: campaign.sequences });
+  return getSequenceSnapshot(campaignId);
+}
+
+async function updateStepVariant(
+  campaignId: string,
+  sequenceIndex: number,
+  stepIndex: number,
+  variantIndex: number,
+  variant: Variant
+): Promise<SequenceSnapshot> {
+  if (!variant.body || variant.body.trim().length === 0) {
+    throw new Error("variant.body is required and must be non-empty.");
+  }
+  const campaign = await apiRequest<Campaign>(
+    `/campaigns/${encodeURIComponent(campaignId)}`
+  );
+  const step = ensureStep(campaign, sequenceIndex, stepIndex);
+  const variants = step.variants || [];
+  if (variantIndex < 0 || variantIndex >= variants.length) {
+    throw new Error(
+      `variantIndex ${variantIndex} out of range for step ${stepIndex} (0..${variants.length - 1}).`
+    );
+  }
+  variants[variantIndex] = {
+    subject: variant.subject ?? variants[variantIndex].subject ?? "",
+    body: variant.body,
+  };
+  step.variants = variants;
+  await patchCampaign(campaignId, { sequences: campaign.sequences });
+  return getSequenceSnapshot(campaignId);
+}
+
+async function removeStepVariant(
+  campaignId: string,
+  sequenceIndex: number,
+  stepIndex: number,
+  variantIndex: number
+): Promise<SequenceSnapshot> {
+  const campaign = await apiRequest<Campaign>(
+    `/campaigns/${encodeURIComponent(campaignId)}`
+  );
+  const step = ensureStep(campaign, sequenceIndex, stepIndex);
+  const variants = step.variants || [];
+  if (variants.length <= 1) {
+    throw new Error(
+      `Refusing to remove the last variant on step ${stepIndex}. A step with zero variants cannot send.`
+    );
+  }
+  if (variantIndex < 0 || variantIndex >= variants.length) {
+    throw new Error(
+      `variantIndex ${variantIndex} out of range for step ${stepIndex} (0..${variants.length - 1}).`
+    );
+  }
+  variants.splice(variantIndex, 1);
+  step.variants = variants;
+  await patchCampaign(campaignId, { sequences: campaign.sequences });
+  return getSequenceSnapshot(campaignId);
+}
+
 // Analytics Functions
+
 async function getCampaignAnalytics(campaignId: string): Promise<CampaignAnalytics> {
   return apiRequest<CampaignAnalytics>(`/campaigns/${encodeURIComponent(campaignId)}/analytics`);
 }
@@ -431,6 +601,90 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["campaignId"],
       },
     },
+    // Sequence Variant Tools (A/B testing)
+    {
+      name: "instantly_get_sequence",
+      description: "Flat snapshot of a campaign's sequence: every step + every variant with index, subject, body preview, and body length. Use this before adding/updating/removing variants so you have the right indices.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          campaignId: { type: "string", description: "Campaign ID" },
+        },
+        required: ["campaignId"],
+      },
+    },
+    {
+      name: "instantly_add_step_variant",
+      description: "Append a new A/B variant to a step in a campaign sequence. Instantly auto-rotates variants on new sends (existing scheduled sends are unaffected). Subject is optional (follow-up steps usually leave it blank to reply on the same thread). Body is required and accepts HTML. Returns a fresh snapshot after the PATCH.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          campaignId: { type: "string", description: "Campaign ID" },
+          sequenceIndex: {
+            type: "number",
+            description: "Sequence index (almost always 0 — most campaigns have one sequence).",
+            default: 0,
+          },
+          stepIndex: {
+            type: "number",
+            description: "Step index within the sequence (0 = first email, 1 = first follow-up, etc.).",
+          },
+          subject: {
+            type: "string",
+            description: "Subject line for the variant. Leave empty for follow-up steps that reply on the same thread.",
+          },
+          body: {
+            type: "string",
+            description: "HTML body for the variant. Required, non-empty.",
+          },
+        },
+        required: ["campaignId", "stepIndex", "body"],
+      },
+    },
+    {
+      name: "instantly_update_step_variant",
+      description: "Replace an existing variant at a specific index. DESTRUCTIVE — overwrites the previous subject + body. Use instantly_get_sequence first to confirm the variantIndex you want to change. Returns a fresh snapshot after the PATCH.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          campaignId: { type: "string", description: "Campaign ID" },
+          sequenceIndex: {
+            type: "number",
+            description: "Sequence index (almost always 0).",
+            default: 0,
+          },
+          stepIndex: { type: "number", description: "Step index within the sequence." },
+          variantIndex: { type: "number", description: "Variant index within the step (0 = original)." },
+          subject: {
+            type: "string",
+            description: "New subject. If omitted, keeps the existing subject.",
+          },
+          body: {
+            type: "string",
+            description: "New HTML body. Required, non-empty.",
+          },
+        },
+        required: ["campaignId", "stepIndex", "variantIndex", "body"],
+      },
+    },
+    {
+      name: "instantly_remove_step_variant",
+      description: "Remove a variant from a step. DESTRUCTIVE. Refuses to remove the last remaining variant on a step (a step with zero variants cannot send). Returns a fresh snapshot after the PATCH.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          campaignId: { type: "string", description: "Campaign ID" },
+          sequenceIndex: {
+            type: "number",
+            description: "Sequence index (almost always 0).",
+            default: 0,
+          },
+          stepIndex: { type: "number", description: "Step index within the sequence." },
+          variantIndex: { type: "number", description: "Variant index within the step." },
+        },
+        required: ["campaignId", "stepIndex", "variantIndex"],
+      },
+    },
     // Analytics Tools
     {
       name: "instantly_get_analytics",
@@ -584,6 +838,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "instantly_pause_campaign": {
         const result = await pauseCampaign(args?.campaignId as string);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      // Sequence Variants (A/B testing)
+      case "instantly_get_sequence": {
+        const result = await getSequenceSnapshot(args?.campaignId as string);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "instantly_add_step_variant": {
+        const result = await addStepVariant(
+          args?.campaignId as string,
+          (args?.sequenceIndex as number) ?? 0,
+          args?.stepIndex as number,
+          {
+            subject: args?.subject as string | undefined,
+            body: args?.body as string,
+          }
+        );
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "instantly_update_step_variant": {
+        const result = await updateStepVariant(
+          args?.campaignId as string,
+          (args?.sequenceIndex as number) ?? 0,
+          args?.stepIndex as number,
+          args?.variantIndex as number,
+          {
+            subject: args?.subject as string | undefined,
+            body: args?.body as string,
+          }
+        );
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "instantly_remove_step_variant": {
+        const result = await removeStepVariant(
+          args?.campaignId as string,
+          (args?.sequenceIndex as number) ?? 0,
+          args?.stepIndex as number,
+          args?.variantIndex as number
+        );
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
